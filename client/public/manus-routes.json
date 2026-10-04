@@ -1,0 +1,1 @@
+{"routes":[{"path":"/","title":"Workspace"},{"path":"/documents","title":"Documents"},{"path":"/evaluations","title":"RAG Evaluation"},{"path":"/admin","title":"Admin Dashboard"},{"path":"/settings","title":"Settings"},{"path":"/404","title":"Not Found"}]}
