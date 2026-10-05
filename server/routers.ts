@@ -3,7 +3,7 @@ import { router, publicProcedure } from "./_core/trpc";
 import { systemRouter } from "./_core/systemRouter";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
-import { askQuestion, getAdminMetrics, getEvaluations, getOverview, ingestSource, listDocuments, runEvaluation } from "./workspace";
+import { askQuestion, getAdminMetrics, getEvaluations, getOverview, getSettings, ingestSource, listDocuments, runEvaluation, updateSettings } from "./workspace";
 
 export const appRouter = router({
   system: systemRouter,
@@ -23,6 +23,8 @@ export const appRouter = router({
     evaluations: publicProcedure.query(() => getEvaluations()),
     runEvaluation: publicProcedure.mutation(() => runEvaluation()),
     admin: publicProcedure.query(() => getAdminMetrics()),
+    settings: publicProcedure.query(() => getSettings()),
+    updateSettings: publicProcedure.input(z.object({ topK: z.number().int().min(1).max(20), notifications: z.boolean(), answerCacheEnabled: z.boolean(), evaluationTelemetryEnabled: z.boolean(), theme: z.enum(["light", "dark"]).optional() })).mutation(({ input }) => updateSettings(input)),
   }),
 });
 
