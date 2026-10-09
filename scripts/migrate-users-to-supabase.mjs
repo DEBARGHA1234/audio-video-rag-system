@@ -1,6 +1,13 @@
 import mysql from "mysql2/promise";
 import { createClient } from "@supabase/supabase-js";
 
+if (process.env.SUPABASE_DATABASE_URL) {
+  throw new Error("Refusing db:copy-users: SUPABASE_DATABASE_URL is set; the Postgres cutover has begun.");
+}
+if (process.env.CUTOVER_DONE === "1") {
+  throw new Error("Refusing db:copy-users: CUTOVER_DONE=1 indicates the cutover is complete.");
+}
+
 const mysqlUrl = process.env.DATABASE_URL;
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -32,8 +39,21 @@ const supabase = createClient(supabaseUrl, serviceKey, {
 });
 
 if (payload.length > 0) {
-  const { error } = await supabase.from("users").upsert(payload, { onConflict: "open_id" });
-  if (error) throw new Error(`Supabase users upsert failed: ${error.message}`);
+  // Insert new identities only. Existing rows are left untouched by the conflict operation.
+  const { error } = await supabase.from("users").upsert(payload, {
+    onConflict: "open_id",
+    ignoreDuplicates: true,
+  });
+  if (error) throw new Error(`Supabase users insert failed: ${error.message}`);
+
+  // The only mutable fields this compatibility copy is allowed to refresh on rerun.
+  for (const row of payload) {
+    const { error: updateError } = await supabase
+      .from("users")
+      .update({ name: row.name, email: row.email, login_method: row.login_method })
+      .eq("open_id", row.open_id);
+    if (updateError) throw new Error(`Supabase users profile refresh failed: ${updateError.message}`);
+  }
 }
 
 const { data, error } = await supabase.from("users").select("id, role").limit(1000);
@@ -44,4 +64,6 @@ console.log(JSON.stringify({
   destination_rows: data?.length ?? 0,
   destination_admins: data?.filter(row => row.role === "admin").length ?? 0,
   idempotency_key: "open_id",
+  conflict_updates: ["name", "email", "login_method"],
+  protected_on_conflict: ["role", "created_at", "updated_at", "last_signed_in"],
 }));
