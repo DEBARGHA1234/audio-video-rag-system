@@ -62,3 +62,21 @@ This mismatch must be resolved explicitly before adding a foreign key or changin
 ## Decision
 
 The database is small enough for an idempotent additive Postgres users migration and a controlled data copy. The main unresolved migration decision is whether the runtime should switch directly after parity checks or use a short compatibility window with both drivers installed. The proposed plan chooses the compatibility window.
+
+## Additive migration verification
+
+- `public.users` rows: 1
+- Distinct `open_id` values: 1
+- Admin rows: 0
+- RLS enabled: yes
+- Explicit policy count: 1
+- Columns verified: `id`, `open_id`, `name`, `email`, `login_method`, `role`, `created_at`, `updated_at`, `last_signed_in`
+- Idempotent copy rerun: passed; destination remained one row.
+- No MySQL table was deleted or altered.
+- No destructive SQL was executed.
+
+## Repository checks
+
+- `pnpm check`: passed
+- `pnpm test`: passed — 2 files, 6 tests
+- `pnpm build`: passed

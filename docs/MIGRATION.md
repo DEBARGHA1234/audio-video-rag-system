@@ -186,3 +186,17 @@ The implementation should produce a report containing:
 Approval is requested for **Phase A read-only preflight only** first. Phase A does not mutate the live database. After Phase A produces its evidence, a second approval will be requested before applying the additive Postgres schema migration or copying any user data.
 
 No destructive SQL is included or authorized by this document.
+
+## Execution record
+
+The following approved steps completed on 2026-10-10:
+
+- Applied additive `public.users` table migration through the authorized Supabase database connector.
+- Enabled RLS and created one server-only deny policy for `public.users`.
+- Copied the one MySQL user row idempotently using `open_id` as the conflict key.
+- Re-ran `pnpm db:copy-users`; destination remained one row with zero admins and no duplicate creation.
+- Added `postgres` dependency, `drizzle.postgres.config.ts`, `drizzle/postgres-schema.ts`, and a repeatable `pnpm db:copy-users` command.
+- Moved the evaluation trend SQL into `drizzle/0002_contextcore_evaluation_daily.sql`.
+- `pnpm check`, `pnpm test`, and `pnpm build` passed.
+
+The live application still uses the legacy MySQL Drizzle runtime during the compatibility window. The Postgres Drizzle runtime switch is blocked until a direct Supabase Postgres connection string is supplied as the server-only `SUPABASE_DATABASE_URL`; the current runtime exposes only `SUPABASE_URL` and the service-role REST key. No existing MySQL table was deleted or altered.
