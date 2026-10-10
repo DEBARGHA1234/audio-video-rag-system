@@ -80,3 +80,9 @@ The database is small enough for an idempotent additive Postgres users migration
 - `pnpm check`: passed
 - `pnpm test`: passed — 2 files, 6 tests
 - `pnpm build`: passed
+
+## Identity sequence verification
+
+The approved `0003_contextcore_users_identity_sequence.sql` migration was applied on 2026-10-10. Before verification, `max(public.users.id)` was 1. A normal Supabase upsert without an explicit `id` allocated ID 2, proving the identity sequence advanced. Exactly one temporary test row was deleted by its unique generated `open_id` marker.
+
+Post-verification state: `public.users` has 1 row, `max(id) = 1`, the sequence last value is 2, RLS remains enabled, and the table has 1 policy. No identity or membership data changed.

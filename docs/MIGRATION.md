@@ -200,3 +200,7 @@ The following approved steps completed on 2026-10-10:
 - `pnpm check`, `pnpm test`, and `pnpm build` passed.
 
 The live application still uses the legacy MySQL Drizzle runtime during the compatibility window. The Postgres Drizzle runtime switch is blocked until a direct Supabase Postgres connection string is supplied as the server-only `SUPABASE_DATABASE_URL`; the current runtime exposes only `SUPABASE_URL` and the service-role REST key. No existing MySQL table was deleted or altered.
+
+## Sequence verification record
+
+After explicit approval, the numbered identity-sequence migration was applied. A normal no-explicit-ID upsert allocated the next ID (`2` after the existing maximum `1`), and exactly that temporary test row was removed. The remaining users table count is `1`; no identity or membership data changed. Runtime authorization remains unchanged until the feature-flagged Postgres phase is approved and tested.
