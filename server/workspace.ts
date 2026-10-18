@@ -1,8 +1,18 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { transcribeAudio } from "./_core/voiceTranscription";
 import { CONTEXTCORE_WORKSPACE_ID, getSupabase, requireData, requireMutation } from "./supabase";
+import {
+  formatTimestampRange,
+  getMediaMetadata,
+  mediaChunkMetadata,
+  normalizeMediaSegments,
+  type MediaMetadata,
+  type MediaSegment,
+  type MediaSegmentInput,
+} from "./media";
 
 export type DocumentStatus = "indexed" | "processing" | "failed";
-export type SourceKind = "PDF" | "DOCX" | "MD" | "CSV" | "JSON" | "URL" | "TXT" | "AUDIO";
+export type SourceKind = "PDF" | "DOCX" | "MD" | "CSV" | "JSON" | "URL" | "TXT" | "AUDIO" | "VIDEO";
 
 export interface DemoDocument {
   id: string;
@@ -18,11 +28,27 @@ export interface DemoDocument {
   content: string;
 }
 
+export interface QueryCitation {
+  documentId: string;
+  document: string;
+  chunk: string;
+  score: number;
+  excerpt: string;
+  chunkId?: string;
+  startMs?: number;
+  endMs?: number;
+  speaker?: string;
+  timestampLabel?: string;
+  source?: string;
+  sourceKind?: SourceKind;
+  corrected?: boolean;
+}
+
 export interface QueryLog {
   id: string;
   question: string;
   answer: string;
-  citations: Array<{ documentId: string; document: string; chunk: string; score: number; excerpt: string }>;
+  citations: QueryCitation[];
   latency: number;
   tokens: number;
   cacheHit: boolean;
@@ -35,24 +61,75 @@ export interface IngestInput {
   kind?: string;
   content?: string;
   size?: number;
+  segments?: MediaSegmentInput[];
+  mediaDurationMs?: number;
+  transcriptVersion?: number;
 }
 
 type DocumentRow = {
-  id: string; name: string; kind: SourceKind; display_size: string; chunk_count: number; status: DocumentStatus;
-  uploaded_at: string; summary: string; source_uri: string; tags: string[]; cleaned_content: string;
+  id: string;
+  name: string;
+  kind: SourceKind;
+  display_size: string;
+  chunk_count: number;
+  status: DocumentStatus;
+  uploaded_at: string;
+  summary: string;
+  source_uri: string;
+  tags: string[];
+  cleaned_content: string;
 };
 type QueryRow = {
-  id: string; question: string; answer: string; latency_ms: number | null; total_tokens: number | null;
-  cache_hit: boolean; created_at: string; status: string;
+  id: string;
+  question: string;
+  answer: string;
+  latency_ms: number | null;
+  total_tokens: number | null;
+  cache_hit: boolean;
+  created_at: string;
+  status: string;
 };
-type CitationRow = { query_id: string; document_id: string; rank: number; score: number; excerpt: string; documents?: { name: string } | Array<{ name: string }> | null };
-type ChunkRow = { id: string; document_id: string; chunk_index: number; content: string };
+type CitationRow = {
+  query_id: string;
+  document_id: string;
+  chunk_id: string | null;
+  rank: number;
+  score: number;
+  excerpt: string;
+  documents?: { name: string; source_uri: string; kind: SourceKind } | Array<{ name: string; source_uri: string; kind: SourceKind }> | null;
+};
+type ChunkRow = {
+  id: string;
+  document_id: string;
+  workspace_id?: string;
+  chunk_index: number;
+  content: string;
+  metadata: unknown;
+  is_demo?: boolean;
+  created_at?: string;
+};
+type RelatedDocument = { name: string; source_uri: string; kind: SourceKind };
+type RelationDocument = RelatedDocument | RelatedDocument[] | null | undefined;
+
+type EvidenceItem = {
+  documentId: string;
+  documentName: string;
+  source: string;
+  sourceKind: SourceKind;
+  chunkId: string;
+  chunkIndex: number;
+  content: string;
+  score: number;
+  media: MediaMetadata | null;
+};
 
 function normalize(value: string) { return value.toLowerCase().replace(/\s+/g, " ").trim(); }
 function hash(value: string) { return createHash("sha256").update(value).digest("hex"); }
 function chunkText(value: string) {
   const words = value.split(/\s+/).filter(Boolean);
-  const size = 80; const overlap = 12; const chunks: string[] = [];
+  const size = 80;
+  const overlap = 12;
+  const chunks: string[] = [];
   for (let index = 0; index < words.length; index += size - overlap) {
     chunks.push(words.slice(index, index + size).join(" "));
     if (index + size >= words.length) break;
@@ -60,15 +137,20 @@ function chunkText(value: string) {
   return chunks.length ? chunks : [value];
 }
 function kindFromInput(input: IngestInput): SourceKind {
-  if (input.kind && ["PDF", "DOCX", "MD", "CSV", "JSON", "URL", "TXT", "AUDIO"].includes(input.kind.toUpperCase())) return input.kind.toUpperCase() as SourceKind;
-  if (/^https?:\/\//i.test(input.source)) return "URL";
+  if (input.kind && ["PDF", "DOCX", "MD", "CSV", "JSON", "URL", "TXT", "AUDIO", "VIDEO"].includes(input.kind.toUpperCase())) return input.kind.toUpperCase() as SourceKind;
+  if (/^https?:\/\//i.test(input.source)) {
+    if (/\.(mp4|webm|mov)(?:\?|$)/i.test(input.source)) return "VIDEO";
+    if (/\.(mp3|wav|m4a|ogg|aac)(?:\?|$)/i.test(input.source)) return "AUDIO";
+    return "URL";
+  }
   const extension = input.name?.split(".").pop()?.toLowerCase();
   if (extension === "pdf") return "PDF";
   if (extension === "docx") return "DOCX";
   if (extension === "md" || extension === "markdown") return "MD";
   if (extension === "csv") return "CSV";
   if (extension === "json") return "JSON";
-  if (["mp3", "wav", "m4a"].includes(extension ?? "")) return "AUDIO";
+  if (["mp3", "wav", "m4a", "ogg", "aac"].includes(extension ?? "")) return "AUDIO";
+  if (["mp4", "webm", "mov"].includes(extension ?? "")) return "VIDEO";
   return "TXT";
 }
 function formatBytes(bytes?: number) {
@@ -89,19 +171,52 @@ function relativeTime(value: string) {
 function mapDocument(row: DocumentRow): DemoDocument {
   return { id: row.id, name: row.name, kind: row.kind, size: row.display_size, chunks: row.chunk_count, status: row.status, uploadedAt: relativeTime(row.uploaded_at), summary: row.summary, source: row.source_uri, tags: row.tags ?? [], content: row.cleaned_content };
 }
-function mapQuery(row: QueryRow, citations: QueryLog["citations"] = []): QueryLog {
+function mapQuery(row: QueryRow, citations: QueryCitation[] = []): QueryLog {
   return { id: row.id, question: row.question, answer: row.answer, citations, latency: (row.latency_ms ?? 0) / 1000, tokens: row.total_tokens ?? 0, cacheHit: row.cache_hit, createdAt: relativeTime(row.created_at) };
 }
+function relatedDocument(value: RelationDocument): RelatedDocument | null {
+  return Array.isArray(value) ? value[0] ?? null : value ?? null;
+}
+function citationFromEvidence(item: EvidenceItem, rank: number): QueryCitation {
+  const timestampLabel = item.media ? formatTimestampRange(item.media) : undefined;
+  return {
+    documentId: item.documentId,
+    document: item.documentName,
+    chunk: timestampLabel ? `${timestampLabel}${item.media?.speaker ? ` · ${item.media.speaker}` : ""}` : `Chunk ${String(rank + 1).padStart(2, "0")}`,
+    score: Number(item.score.toFixed(2)),
+    excerpt: item.content.slice(0, 240) + (item.content.length > 240 ? "…" : ""),
+    chunkId: item.chunkId,
+    ...(item.media ? { startMs: item.media.startMs, endMs: item.media.endMs, speaker: item.media.speaker, timestampLabel, corrected: item.media.corrected } : {}),
+    source: item.source,
+    sourceKind: item.sourceKind,
+  };
+}
+
 async function getCitations(queryIds: string[]) {
-  if (!queryIds.length) return new Map<string, QueryLog["citations"]>();
+  if (!queryIds.length) return new Map<string, QueryCitation[]>();
   const supabase = getSupabase();
-  const result = await supabase.from("query_citations").select("query_id, document_id, rank, score, excerpt, documents(name)").in("query_id", queryIds).order("rank", { ascending: true });
+  const result = await supabase.from("query_citations").select("query_id, document_id, chunk_id, rank, score, excerpt, documents(name, source_uri, kind)").in("query_id", queryIds).order("rank", { ascending: true });
   const rows = requireData(result, "Loading citations") as CitationRow[];
-  const grouped = new Map<string, QueryLog["citations"]>();
+  const chunkIds = rows.map(row => row.chunk_id).filter((id): id is string => Boolean(id));
+  const chunkResult = chunkIds.length ? await supabase.from("document_chunks").select("id, metadata").in("id", chunkIds) : { data: [], error: null };
+  const chunks = (requireData(chunkResult, "Loading citation metadata") as Array<{ id: string; metadata: unknown }>).reduce((map, row) => map.set(row.id, row.metadata), new Map<string, unknown>());
+  const grouped = new Map<string, QueryCitation[]>();
   for (const row of rows) {
+    const document = relatedDocument(row.documents);
+    const media = getMediaMetadata(chunks.get(row.chunk_id ?? ""));
+    const timestampLabel = media ? formatTimestampRange(media) : undefined;
     const list = grouped.get(row.query_id) ?? [];
-    const relatedDocument = Array.isArray(row.documents) ? row.documents[0] : row.documents;
-    list.push({ documentId: row.document_id, document: relatedDocument?.name ?? "Source", chunk: `Chunk ${String(row.rank + 2).padStart(2, "0")}`, score: Number(row.score), excerpt: row.excerpt });
+    list.push({
+      documentId: row.document_id,
+      document: document?.name ?? "Source",
+      chunk: timestampLabel ? `${timestampLabel}${media?.speaker ? ` · ${media.speaker}` : ""}` : `Chunk ${String(row.rank).padStart(2, "0")}`,
+      score: Number(row.score),
+      excerpt: row.excerpt,
+      ...(row.chunk_id ? { chunkId: row.chunk_id } : {}),
+      ...(media ? { startMs: media.startMs, endMs: media.endMs, speaker: media.speaker, timestampLabel, corrected: media.corrected } : {}),
+      source: document?.source_uri,
+      sourceKind: document?.kind,
+    });
     grouped.set(row.query_id, list);
   }
   return grouped;
@@ -166,39 +281,64 @@ export async function listDocuments(page = 1, pageSize = 6, search = "") {
 export async function ingestSource(input: IngestInput) {
   const supabase = getSupabase();
   const source = input.source.trim();
-  const content = (input.content?.trim() || (source.startsWith("http") ? `Fetched source: ${source}. The page content was normalized, cleaned, and prepared for retrieval.` : source)).replace(/\s+/g, " ");
-  const chunks = chunkText(content);
+  const segments = normalizeMediaSegments(input.segments ?? []);
+  const content = (segments.length ? segments.map(segment => segment.text).join(" ") : (input.content?.trim() || (source.startsWith("http") ? `Fetched source: ${source}. The page content was normalized, cleaned, and prepared for retrieval.` : source))).replace(/\s+/g, " ");
   const kind = kindFromInput(input);
-  const id = crypto.randomUUID();
+  const version = Math.max(1, input.transcriptVersion ?? 1);
+  const blueprints = segments.length
+    ? segments.map(segment => ({ content: segment.text, metadata: { media: mediaChunkMetadata(segment, version) } }))
+    : chunkText(content).map(chunk => ({ content: chunk, metadata: { source: "ingest", transcriptVersion: version } }));
+  const id = randomUUID();
   const name = input.name || (source.startsWith("http") ? new URL(source).hostname : "Pasted research note.txt");
-  const document = { id, workspace_id: CONTEXTCORE_WORKSPACE_ID, name, kind, source_uri: source, content_hash: hash(content), raw_size_bytes: input.size ?? null, display_size: formatBytes(input.size), status: "indexed", summary: content.slice(0, 142) + (content.length > 142 ? "…" : ""), cleaned_content: content, tags: ["New source"], chunk_count: chunks.length, uploaded_by_manus_user_id: null, is_demo: false };
+  const speakerCount = new Set(segments.map(segment => segment.speaker)).size;
+  const tags = segments.length ? ["Transcript", "Timestamped", `${speakerCount} speaker${speakerCount === 1 ? "" : "s"}`] : ["New source"];
+  const document = { id, workspace_id: CONTEXTCORE_WORKSPACE_ID, name, kind, source_uri: source, content_hash: hash(content), raw_size_bytes: input.size ?? null, display_size: formatBytes(input.size), status: "indexed", summary: content.slice(0, 142) + (content.length > 142 ? "…" : ""), cleaned_content: content, tags, chunk_count: blueprints.length, uploaded_by_manus_user_id: null, is_demo: false };
   const insertResult = await supabase.from("documents").insert(document).select("id, name, kind, display_size, chunk_count, status, uploaded_at, summary, source_uri, tags, cleaned_content").single();
   const inserted = requireData(insertResult, "Saving document") as DocumentRow;
-  const chunkRows = chunks.map((chunk, index) => ({ id: crypto.randomUUID(), document_id: id, workspace_id: CONTEXTCORE_WORKSPACE_ID, chunk_index: index, content: chunk, content_hash: hash(`${id}:${index}:${chunk}`), metadata: { source: "ingest" }, is_demo: false }));
+  const chunkRows = blueprints.map((blueprint, index) => ({ id: randomUUID(), document_id: id, workspace_id: CONTEXTCORE_WORKSPACE_ID, chunk_index: index, content: blueprint.content, content_hash: hash(`${id}:${index}:${blueprint.content}`), token_count: blueprint.content.split(/\s+/).filter(Boolean).length, embedding: null, embedding_provider: null, metadata: blueprint.metadata, is_demo: false }));
   requireMutation(await supabase.from("document_chunks").insert(chunkRows), "Saving document chunks");
-  requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: "index_refreshed", label: "Source indexed", detail: `${name} · ${chunks.length} chunks`, tone: "good", is_demo: false }), "Saving activity");
-  return { ...mapDocument(inserted), content: undefined };
+  requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: segments.length ? "transcript_indexed" : "index_refreshed", label: segments.length ? "Transcript indexed" : "Source indexed", detail: `${name} · ${blueprints.length} chunks${segments.length ? ` · ${speakerCount} speakers` : ""}`, tone: "good", is_demo: false }), "Saving activity");
+  return { ...mapDocument(inserted), content: undefined, transcript: segments.length ? { segmentCount: segments.length, speakerCount, durationMs: input.mediaDurationMs ?? Math.max(...segments.map(segment => segment.endMs), 0), version } : undefined };
 }
 
-function chooseEvidence(question: string, documents: DemoDocument[]) {
+export async function transcribeSource(input: { audioUrl: string; language?: string; prompt?: string }) {
+  const result = await transcribeAudio(input);
+  if ("error" in result) throw new Error(result.error);
+  const segments = normalizeMediaSegments(result.segments as unknown[]);
+  return { audioUrl: input.audioUrl, kind: /\.(mp4|webm|mov)(?:\?|$)/i.test(input.audioUrl) ? "VIDEO" as const : "AUDIO" as const, language: result.language, durationMs: Math.round(result.duration * 1000), text: result.text, segments };
+}
+
+async function retrieveEvidence(question: string) {
+  const supabase = getSupabase();
+  const result = await supabase.from("document_chunks").select("id, document_id, chunk_index, content, metadata, documents(name, source_uri, kind)").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).order("chunk_index", { ascending: true }).limit(500);
+  const rows = requireData(result, "Loading retrieval chunks") as Array<{ id: string; document_id: string; chunk_index: number; content: string; metadata: unknown; documents: RelationDocument }>;
   const normalized = normalize(question);
-  return documents.map(document => {
-    let score = 0.66;
-    for (const term of normalized.split(" ")) if (term.length > 3 && normalize(document.content).includes(term)) score += 0.06;
-    if (normalized.includes("latency") && document.id.endsWith("0003")) score = 0.94;
-    if (normalized.includes("rollout") && document.id.endsWith("0001")) score = 0.91;
-    if (normalized.includes("support") && document.id.endsWith("0002")) score = 0.89;
-    if (normalized.includes("validate") && document.id.endsWith("0004")) score = 0.87;
-    return { document, score };
-  }).sort((a, b) => b.score - a.score).slice(0, Math.min(3, documents.length));
+  const terms = normalized.split(" ").filter(term => term.length > 3);
+  return rows.map(row => {
+    const document = relatedDocument(row.documents);
+    const media = getMediaMetadata(row.metadata);
+    const haystack = normalize(`${row.content} ${media?.speaker ?? ""}`);
+    let score = 0.42;
+    for (const term of terms) if (haystack.includes(term)) score += 0.08;
+    if (media && /speaker|who said|said by|according to/i.test(question) && media.speaker !== "Unknown speaker") score += 0.16;
+    if (normalized.includes("latency") && row.document_id.endsWith("0003")) score = 0.94;
+    if (normalized.includes("rollout") && row.document_id.endsWith("0001")) score = 0.91;
+    if (normalized.includes("support") && row.document_id.endsWith("0002")) score = 0.89;
+    if (normalized.includes("validate") && row.document_id.endsWith("0004")) score = 0.87;
+    return { documentId: row.document_id, documentName: document?.name ?? "Source", source: document?.source_uri ?? "", sourceKind: document?.kind ?? "TXT", chunkId: row.id, chunkIndex: row.chunk_index, content: row.content, score, media } satisfies EvidenceItem;
+  }).sort((a, b) => b.score - a.score).slice(0, 6);
 }
 
-async function generateWithPlatform(question: string, evidence: Array<{ document: DemoDocument; score: number }>) {
-  const baseUrl = process.env.MANUS_API_URL; const apiKey = process.env.MANUS_API_KEY;
+async function generateWithPlatform(question: string, evidence: EvidenceItem[]) {
+  const baseUrl = process.env.MANUS_API_URL;
+  const apiKey = process.env.MANUS_API_KEY;
   if (!baseUrl || !apiKey) return null;
-  const context = evidence.map((item, index) => `[${index + 1}] ${item.document.name}\n${item.document.content}`).join("\n\n");
+  const context = evidence.map((item, index) => {
+    const provenance = item.media ? `${formatTimestampRange(item.media)} · ${item.media.speaker}` : `Chunk ${item.chunkIndex + 1}`;
+    return `[${index + 1}] ${item.documentName} · ${provenance}\n${item.content}`;
+  }).join("\n\n");
   try {
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ messages: [{ role: "system", content: "You are ContextCore, a grounded research assistant. Answer only from the supplied context. If the context does not contain the answer, say: I could not find this information in the indexed material. Keep the answer concise." }, { role: "user", content: `Question: ${question}\n\nContext:\n${context}` }] }) });
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ messages: [{ role: "system", content: "You are ContextCore, a grounded research assistant. Answer only from the supplied context. For audio/video evidence, preserve the speaker label and timestamp when relevant. If the context does not contain the answer, say: I could not find this information in the indexed material. Keep the answer concise." }, { role: "user", content: `Question: ${question}\n\nContext:\n${context}` }] }) });
     if (!response.ok) return null;
     const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
     return payload.choices?.[0]?.message?.content?.trim() || null;
@@ -206,17 +346,22 @@ async function generateWithPlatform(question: string, evidence: Array<{ document
 }
 
 export async function askQuestion(question: string) {
-  const supabase = getSupabase(); const normalized = normalize(question); const started = Date.now();
+  const supabase = getSupabase();
+  const normalized = normalize(question);
+  const started = Date.now();
   const cacheResult = await supabase.from("answer_cache").select("answer, citations, latency_ms, total_tokens").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("corpus_version", 1).eq("normalized_question", normalized).maybeSingle();
   if (cacheResult.error) throw new Error(`Loading answer cache failed: ${cacheResult.error.message}`);
-  const documents = await getDocuments(100);
-  const evidence = chooseEvidence(question, documents);
-  let answer: string; let cacheHit = false; let citations: QueryLog["citations"];
+  const evidence = await retrieveEvidence(question);
+  let answer: string;
+  let cacheHit = false;
+  let citations: QueryCitation[];
   if (cacheResult.data) {
-    answer = cacheResult.data.answer; cacheHit = true;
-    citations = (cacheResult.data.citations as Array<{ document?: string; chunk?: string; score?: number }>)?.map((item, index) => ({ documentId: evidence[index]?.document.id ?? "", document: item.document ?? evidence[index]?.document.name ?? "Source", chunk: item.chunk ?? `Chunk ${String(index + 3).padStart(2, "0")}`, score: Number(item.score ?? evidence[index]?.score ?? 0), excerpt: evidence[index]?.document.summary ?? "" })) ?? [];
+    answer = cacheResult.data.answer;
+    cacheHit = true;
+    const cached = (cacheResult.data.citations as QueryCitation[] | null) ?? [];
+    citations = cached.length ? cached.map((item, index) => ({ ...item, chunkId: item.chunkId ?? evidence[index]?.chunkId, startMs: item.startMs ?? evidence[index]?.media?.startMs, endMs: item.endMs ?? evidence[index]?.media?.endMs, speaker: item.speaker ?? evidence[index]?.media?.speaker, timestampLabel: item.timestampLabel ?? (evidence[index]?.media ? formatTimestampRange(evidence[index].media) : undefined) })) : evidence.map(citationFromEvidence);
   } else {
-    const normalizedMatch = documents.length ? await supabase.from("queries").select("answer").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("normalized_question", normalized).eq("status", "answered").order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null, error: null };
+    const normalizedMatch = evidence.length ? await supabase.from("queries").select("answer").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("normalized_question", normalized).eq("status", "answered").order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null, error: null };
     if (normalizedMatch.error) throw new Error(`Loading previous answers failed: ${normalizedMatch.error.message}`);
     answer = normalizedMatch.data?.answer ?? "";
     if (!answer) {
@@ -225,21 +370,85 @@ export async function askQuestion(question: string) {
       else if (normalized.includes("rollout") || normalized.includes("owner")) answer = "Priya Nair is the launch owner for the Q3 product rollout.";
       else if (normalized.includes("support") || normalized.includes("theme")) answer = "Export reliability is the fastest-growing support theme and appears in 31% of tagged conversations.";
       else if (normalized.includes("validate") || normalized.includes("customer")) answer = "The customer asked the team to validate workspace-level permissions with the security team.";
-      else answer = evidence.length ? `The indexed material points to ${evidence[0].document.name}: ${evidence[0].document.summary}` : "I could not find this information in the indexed material.";
-      const modelAnswer = await generateWithPlatform(question, evidence); if (modelAnswer) answer = modelAnswer;
+      else answer = evidence.length ? `The indexed material points to ${evidence[0].documentName}: ${evidence[0].content.slice(0, 160)}` : "I could not find this information in the indexed material.";
+      const modelAnswer = await generateWithPlatform(question, evidence);
+      if (modelAnswer) answer = modelAnswer;
     }
-    citations = evidence.map((item, index) => ({ documentId: item.document.id, document: item.document.name, chunk: `Chunk ${String(index + 3).padStart(2, "0")}`, score: Number(item.score.toFixed(2)), excerpt: item.document.content.slice(0, 160) + "…" }));
+    citations = evidence.map(citationFromEvidence);
   }
   const latencyMs = cacheResult.data?.latency_ms ?? Math.max(1, Date.now() - started);
   const totalTokens = cacheResult.data?.total_tokens ?? 220 + Math.round(answer.length * 0.8);
-  const queryId = crypto.randomUUID();
+  const queryId = randomUUID();
   const queryResult = await supabase.from("queries").insert({ id: queryId, workspace_id: CONTEXTCORE_WORKSPACE_ID, question, normalized_question: normalized, answer, status: "answered", latency_ms: latencyMs, retrieval_latency_ms: Math.max(1, Math.round(latencyMs * 0.4)), total_tokens: totalTokens, cache_hit: cacheHit, model: cacheHit ? "cache" : "grounded" }).select("id, question, answer, latency_ms, total_tokens, cache_hit, created_at, status").single();
   const query = requireData(queryResult, "Saving query") as QueryRow;
-  const citationRows = citations.map((citation, index) => ({ query_id: queryId, document_id: citation.documentId, rank: index + 1, score: citation.score, excerpt: citation.excerpt, is_demo: false }));
+  const citationRows = citations.map((citation, index) => ({ query_id: queryId, document_id: citation.documentId, chunk_id: citation.chunkId ?? null, rank: index + 1, score: citation.score, excerpt: citation.excerpt, is_demo: false }));
   if (citationRows.length) requireMutation(await supabase.from("query_citations").insert(citationRows), "Saving citations");
   if (!cacheHit) await supabase.from("answer_cache").upsert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, corpus_version: 1, normalized_question: normalized, answer, citations, latency_ms: latencyMs, total_tokens: totalTokens, expires_at: new Date(Date.now() + 30 * 86400000).toISOString(), is_demo: false });
   requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: cacheHit ? "cache_hit" : "answer_generated", label: cacheHit ? "Answer served from cache" : "Grounded answer generated", detail: question, tone: cacheHit ? "info" : "good", is_demo: false }), "Saving query activity");
   return mapQuery(query, citations);
+}
+
+export async function getTranscript(documentId: string) {
+  const supabase = getSupabase();
+  const documentResult = await supabase.from("documents").select("id, name, kind, status, cleaned_content, source_uri").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", documentId).single();
+  const document = requireData(documentResult, "Loading transcript document") as { id: string; name: string; kind: SourceKind; status: DocumentStatus; cleaned_content: string; source_uri: string };
+  const chunksResult = await supabase.from("document_chunks").select("id, document_id, chunk_index, content, metadata, created_at").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("document_id", documentId).order("chunk_index", { ascending: true }).limit(5000);
+  const chunks = requireData(chunksResult, "Loading transcript segments") as ChunkRow[];
+  const mediaSegments = chunks.map(row => {
+    const media = getMediaMetadata(row.metadata);
+    return { id: media?.segmentId ?? row.id, chunkId: row.id, startMs: media?.startMs ?? 0, endMs: media?.endMs ?? 0, text: row.content, speaker: media?.speaker ?? "Document", corrected: media?.corrected ?? false, timestampLabel: media ? formatTimestampRange(media) : null, transcriptVersion: media?.transcriptVersion ?? null };
+  });
+  return { document: { id: document.id, name: document.name, kind: document.kind, status: document.status, source: document.source_uri }, segments: mediaSegments, text: document.cleaned_content, isMedia: document.kind === "AUDIO" || document.kind === "VIDEO", version: Math.max(1, ...mediaSegments.map(segment => segment.transcriptVersion ?? 1)) };
+}
+
+async function reindexDocumentInternal(documentId: string) {
+  const supabase = getSupabase();
+  const documentResult = await supabase.from("documents").select("id, name, cleaned_content, summary, content_hash, chunk_count, status").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", documentId).single();
+  const document = requireData(documentResult, "Loading document for re-index") as { id: string; name: string; cleaned_content: string; summary: string; content_hash: string; chunk_count: number; status: DocumentStatus };
+  const chunksResult = await supabase.from("document_chunks").select("id, document_id, workspace_id, chunk_index, content, metadata, is_demo, created_at").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("document_id", documentId).order("chunk_index", { ascending: true }).limit(5000);
+  const existing = requireData(chunksResult, "Loading chunks for re-index") as ChunkRow[];
+  const mediaRows = existing.map(row => ({ row, media: getMediaMetadata(row.metadata) })).filter((item): item is { row: ChunkRow; media: MediaMetadata } => Boolean(item.media));
+  const nextVersion = mediaRows.length ? Math.max(...mediaRows.map(item => item.media.transcriptVersion), 1) + 1 : 1;
+  const blueprints = mediaRows.length
+    ? mediaRows.map(item => ({ content: item.row.content, metadata: { media: { ...item.media, transcriptVersion: nextVersion } } }))
+    : chunkText(document.cleaned_content).map(chunk => ({ content: chunk, metadata: { source: "reindex", transcriptVersion: nextVersion } }));
+  requireMutation(await supabase.from("documents").update({ status: "processing", error_message: null, updated_at: new Date().toISOString() }).eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", documentId), "Marking document for re-index");
+  const now = new Date().toISOString();
+  const rows = blueprints.map((blueprint, index) => ({ id: existing[index]?.id ?? randomUUID(), document_id: documentId, workspace_id: CONTEXTCORE_WORKSPACE_ID, chunk_index: index, content: blueprint.content, content_hash: hash(`${documentId}:${index}:${blueprint.content}`), token_count: blueprint.content.split(/\s+/).filter(Boolean).length, embedding: null, embedding_provider: null, metadata: blueprint.metadata, is_demo: existing[index]?.is_demo ?? false, created_at: existing[index]?.created_at ?? now }));
+  if (rows.length) requireMutation(await supabase.from("document_chunks").upsert(rows, { onConflict: "id" }), "Writing re-indexed chunks");
+  const extraIds = existing.slice(rows.length).map(row => row.id);
+  if (extraIds.length) requireMutation(await supabase.from("document_chunks").delete().in("id", extraIds), "Removing stale chunks");
+  const cleanedContent = mediaRows.length ? blueprints.map(blueprint => blueprint.content).join(" ") : document.cleaned_content;
+  requireMutation(await supabase.from("documents").update({ cleaned_content: cleanedContent, content_hash: hash(cleanedContent), summary: cleanedContent.slice(0, 142) + (cleanedContent.length > 142 ? "…" : ""), chunk_count: rows.length, status: "indexed", error_message: null, updated_at: now }).eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", documentId), "Finalizing re-index");
+  const cacheDelete = await supabase.from("answer_cache").delete().eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("is_demo", false);
+  if (cacheDelete.error) throw new Error(`Invalidating answer cache failed: ${cacheDelete.error.message}`);
+  requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: "index_refreshed", label: "Document re-indexed", detail: `${document.name} · ${rows.length} chunks · transcript v${nextVersion}`, tone: "good", is_demo: false }), "Saving re-index activity");
+  return getTranscript(documentId);
+}
+
+export async function reindexDocument(documentId: string) {
+  try {
+    return await reindexDocumentInternal(documentId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Re-index failed.";
+    await getSupabase().from("documents").update({ status: "failed", error_message: message, updated_at: new Date().toISOString() }).eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", documentId);
+    throw error;
+  }
+}
+
+export async function correctTranscriptSegment(input: { documentId: string; segmentId: string; text: string }) {
+  const text = input.text.replace(/\s+/g, " ").trim();
+  if (!text) throw new Error("Correction text cannot be empty.");
+  const supabase = getSupabase();
+  const chunksResult = await supabase.from("document_chunks").select("id, content, metadata").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("document_id", input.documentId).limit(5000);
+  const chunks = requireData(chunksResult, "Loading transcript correction target") as Array<{ id: string; content: string; metadata: unknown }>;
+  const target = chunks.find(row => getMediaMetadata(row.metadata)?.segmentId === input.segmentId || row.id === input.segmentId);
+  if (!target) throw new Error("Transcript segment was not found.");
+  const media = getMediaMetadata(target.metadata);
+  if (!media) throw new Error("Only timestamped transcript segments can be corrected.");
+  const nextMetadata = { ...(target.metadata as Record<string, unknown>), media: { ...media, corrected: true, originalText: media.originalText ?? target.content } };
+  requireMutation(await supabase.from("document_chunks").update({ content: text, content_hash: hash(`${input.documentId}:${target.id}:${text}`), metadata: nextMetadata, embedding: null, embedding_provider: null }).eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", target.id), "Saving transcript correction");
+  return reindexDocument(input.documentId);
 }
 
 export async function getEvaluations() {
@@ -258,18 +467,23 @@ export async function getEvaluations() {
 }
 
 export async function runEvaluation() {
-  const supabase = getSupabase(); const evaluations = await getEvaluations();
-  const runResult = await supabase.from("evaluation_runs").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, status: "completed", case_count: evaluations.cases.length, context_precision: evaluations.summary.contextPrecision, faithfulness: evaluations.summary.faithfulness, answer_relevancy: evaluations.summary.answerRelevancy, retrieval_p95_ms: Math.round(evaluations.summary.retrievalP95 * 1000), cost_per_request_usd: evaluations.summary.costPerRequest, started_at: new Date().toISOString(), completed_at: new Date().toISOString(), is_demo: false }).select("id, case_count, completed_at, context_precision, faithfulness, answer_relevancy, retrieval_p95_ms, cost_per_request_usd").single();
+  const supabase = getSupabase();
+  const evaluations = await getEvaluations();
+  const now = new Date().toISOString();
+  const runResult = await supabase.from("evaluation_runs").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, status: "completed", case_count: evaluations.cases.length, context_precision: evaluations.summary.contextPrecision, faithfulness: evaluations.summary.faithfulness, answer_relevancy: evaluations.summary.answerRelevancy, retrieval_p95_ms: Math.round(evaluations.summary.retrievalP95 * 1000), cost_per_request_usd: evaluations.summary.costPerRequest, started_at: now, completed_at: now, is_demo: false }).select("id, case_count, completed_at, context_precision, faithfulness, answer_relevancy, retrieval_p95_ms, cost_per_request_usd").single();
   const run = requireData(runResult, "Saving evaluation run") as { id: string; case_count: number; completed_at: string; context_precision: number; faithfulness: number; answer_relevancy: number; retrieval_p95_ms: number; cost_per_request_usd: number };
   requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: "evaluation_completed", label: "Evaluation completed", detail: `${run.case_count} cases · ${(Number(run.faithfulness) * 100).toFixed(1)}% faithfulness`, tone: "good", is_demo: false }), "Saving evaluation activity");
   return { id: run.id, cases: run.case_count, completedAt: "Just now", contextPrecision: Number(run.context_precision), faithfulness: Number(run.faithfulness), answerRelevancy: Number(run.answer_relevancy), retrievalP95: Number(run.retrieval_p95_ms) / 1000, costPerRequest: Number(run.cost_per_request_usd) };
 }
 
 export async function getAdminMetrics() {
-  const overview = await getOverview(); const supabase = getSupabase();
+  const overview = await getOverview();
+  const supabase = getSupabase();
   const failureResult = await supabase.from("queries").select("id, question, error_message, status, created_at").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("status", "failed").order("created_at", { ascending: false }).limit(5);
   const failures = (failureResult.data ?? []).map(row => ({ id: row.id, endpoint: "rag.answer", message: row.error_message ?? "Request failed", status: "blocked", at: relativeTime(row.created_at), retries: 0 }));
-  const total = overview.queries.length; const cached = overview.queries.filter(query => query.cacheHit).length; const cachedValue = total ? Math.round((cached / total) * 100) : 0;
+  const total = overview.queries.length;
+  const cached = overview.queries.filter(query => query.cacheHit).length;
+  const cachedValue = total ? Math.round((cached / total) * 100) : 0;
   return { ...overview, failures, providers: [{ name: "Manus LLM", value: Math.max(0, 100 - cachedValue - 10), color: "cyan" }, { name: "Cached answers", value: cachedValue, color: "violet" }, { name: "Fallback index", value: 10, color: "amber" }] };
 }
 
