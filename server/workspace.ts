@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { transcribeAudio } from "./_core/voiceTranscription";
 import { CONTEXTCORE_WORKSPACE_ID, getSupabase, requireData, requireMutation } from "./supabase";
+import { storageGetSignedUrl, storagePut } from "./storage";
 import {
   formatTimestampRange,
   getMediaMetadata,
@@ -158,11 +159,24 @@ function chunkText(value: string) {
   }
   return chunks.length ? chunks : [value];
 }
+async function fetchWebText(source: string) {
+  const response = await fetch(source, { headers: { accept: "text/html,text/plain,application/json,application/xml" }, redirect: "follow" });
+  if (!response.ok) throw new Error(`Source fetch failed with HTTP ${response.status}.`);
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!/(text\/html|text\/plain|application\/json|application\/xml)/i.test(contentType)) throw new Error(`Source returned ${contentType || "an unknown content type"}, not readable text.`);
+  const raw = await response.text();
+  const text = /text\/html/i.test(contentType)
+    ? raw.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&")
+    : raw;
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (cleaned.length < 40) throw new Error("The fetched source did not contain enough readable text to index.");
+  return cleaned;
+}
 function kindFromInput(input: IngestInput): SourceKind {
   if (input.kind && ["PDF", "DOCX", "MD", "CSV", "JSON", "URL", "TXT", "AUDIO", "VIDEO"].includes(input.kind.toUpperCase())) return input.kind.toUpperCase() as SourceKind;
   if (/^https?:\/\//i.test(input.source)) {
     if (/\.(mp4|webm|mov)(?:\?|$)/i.test(input.source)) return "VIDEO";
-    if (/\.(mp3|wav|m4a|ogg|aac)(?:\?|$)/i.test(input.source)) return "AUDIO";
+    if (/\.(mp3|wav|m4a|ogg|aac|flac)(?:\?|$)/i.test(input.source)) return "AUDIO";
     return "URL";
   }
   const extension = input.name?.split(".").pop()?.toLowerCase();
@@ -171,7 +185,7 @@ function kindFromInput(input: IngestInput): SourceKind {
   if (extension === "md" || extension === "markdown") return "MD";
   if (extension === "csv") return "CSV";
   if (extension === "json") return "JSON";
-  if (["mp3", "wav", "m4a", "ogg", "aac"].includes(extension ?? "")) return "AUDIO";
+  if (["mp3", "wav", "m4a", "ogg", "aac", "flac"].includes(extension ?? "")) return "AUDIO";
   if (["mp4", "webm", "mov"].includes(extension ?? "")) return "VIDEO";
   return "TXT";
 }
@@ -387,8 +401,9 @@ export async function ingestSource(input: IngestInput) {
   const supabase = getSupabase();
   const source = input.source.trim();
   const segments = normalizeMediaSegments(input.segments ?? []);
-  const content = (segments.length ? segments.map(segment => segment.text).join(" ") : (input.content?.trim() || (source.startsWith("http") ? `Fetched source: ${source}. The page content was normalized, cleaned, and prepared for retrieval.` : source))).replace(/\s+/g, " ");
   const kind = kindFromInput(input);
+  const fetchedContent = kind === "URL" && /^https?:\/\//i.test(source) ? await fetchWebText(source) : undefined;
+  const content = (segments.length ? segments.map(segment => segment.text).join(" ") : (fetchedContent ?? input.content?.trim() ?? source)).replace(/\s+/g, " ");
   const version = Math.max(1, input.transcriptVersion ?? 1);
   const blueprints = segments.length
     ? segments.map(segment => ({ content: segment.text, metadata: { media: mediaChunkMetadata(segment, version) } }))
@@ -416,6 +431,20 @@ export async function transcribeSource(input: { audioUrl: string; language?: str
   return { audioUrl: input.audioUrl, kind: /\.(mp4|webm|mov)(?:\?|$)/i.test(input.audioUrl) ? "VIDEO" as const : "AUDIO" as const, language: result.language, durationMs: Math.round(result.duration * 1000), text: result.text, segments };
 }
 
+export async function transcribeUploadedMedia(input: { filename: string; mimeType: string; base64: string; language?: string; prompt?: string }) {
+  const bytes = Buffer.from(input.base64, "base64");
+  if (!bytes.length) throw new Error("The uploaded media file was empty.");
+  if (bytes.length > 25 * 1024 * 1024) throw new Error("Media files over 25 MB are not supported by the transcription service yet. Provide a reachable media URL or split the file first.");
+  const safeName = input.filename.replace(/[^a-zA-Z0-9._-]/g, "-").slice(-120) || "media.bin";
+  const stored = await storagePut(`contextcore/media/${randomUUID()}-${safeName}`, bytes, input.mimeType || "application/octet-stream");
+  const signedUrl = await storageGetSignedUrl(stored.key);
+  const result = await transcribeAudio({ audioUrl: signedUrl, language: input.language, prompt: input.prompt });
+  if ("error" in result) throw new Error(`${result.error}${result.details ? `: ${result.details}` : ""}`);
+  const segments = normalizeMediaSegments(result.segments as unknown[]);
+  const isVideo = /^video\//i.test(input.mimeType) || /\.(mp4|webm|mov)$/i.test(input.filename);
+  return { audioUrl: stored.url, kind: isVideo ? "VIDEO" as const : "AUDIO" as const, language: result.language, durationMs: Math.round(result.duration * 1000), text: result.text, segments, storageKey: stored.key };
+}
+
 async function retrieveEvidence(question: string, sessionId?: string) {
   const supabase = getSupabase();
   let sessionDocumentIds: string[] = [];
@@ -429,7 +458,7 @@ async function retrieveEvidence(question: string, sessionId?: string) {
   const rows = requireData(result, "Loading retrieval chunks") as Array<{ id: string; document_id: string; chunk_index: number; content: string; metadata: unknown; documents: RelationDocument }>;
   const normalized = normalize(question);
   const terms = normalized.split(" ").filter(term => term.length > 3);
-  return rows.map(row => {
+  const ranked = rows.map(row => {
     const document = relatedDocument(row.documents);
     const media = getMediaMetadata(row.metadata);
     const haystack = normalize(`${row.content} ${media?.speaker ?? ""}`);
@@ -441,23 +470,33 @@ async function retrieveEvidence(question: string, sessionId?: string) {
     if (normalized.includes("support") && row.document_id.endsWith("0002")) score = 0.89;
     if (normalized.includes("validate") && row.document_id.endsWith("0004")) score = 0.87;
     return { documentId: row.document_id, documentName: document?.name ?? "Source", source: document?.source_uri ?? "", sourceKind: document?.kind ?? "TXT", chunkId: row.id, chunkIndex: row.chunk_index, content: row.content, score, media } satisfies EvidenceItem;
-  }).sort((a, b) => b.score - a.score).slice(0, 6);
+  }).sort((a, b) => b.score - a.score);
+  if (sessionId && !sessionDocumentIds.length) return [];
+  if (!sessionId) return ranked.slice(0, 8);
+  const coverage = [...rows].sort((a, b) => a.chunk_index - b.chunk_index).map(row => ranked.find(item => item.chunkId === row.id)).filter((item): item is EvidenceItem => Boolean(item)).slice(0, 24);
+  const selected = [...ranked.slice(0, 16), ...coverage].filter((item, index, all) => all.findIndex(candidate => candidate.chunkId === item.chunkId) === index);
+  return selected.slice(0, 40);
 }
 
 async function generateWithPlatform(question: string, evidence: EvidenceItem[]) {
   const baseUrl = process.env.MANUS_API_URL;
   const apiKey = process.env.MANUS_API_KEY;
-  if (!baseUrl || !apiKey) return null;
+  if (!baseUrl || !apiKey) throw new Error("Grounded answer generation is unavailable because the managed LLM service is not configured.");
   const context = evidence.map((item, index) => {
     const provenance = item.media ? `${formatTimestampRange(item.media)} · ${item.media.speaker}` : `Chunk ${item.chunkIndex + 1}`;
     return `[${index + 1}] ${item.documentName} · ${provenance}\n${item.content}`;
   }).join("\n\n");
   try {
-    const response = await fetch(`${baseUrl}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ messages: [{ role: "system", content: "You are ContextCore, a grounded research assistant. Answer only from the supplied context. For audio/video evidence, preserve the speaker label and timestamp when relevant. If the context does not contain the answer, say: I could not find this information in the indexed material. Keep the answer concise." }, { role: "user", content: `Question: ${question}\n\nContext:\n${context}` }] }) });
-    if (!response.ok) return null;
-    const payload = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    return payload.choices?.[0]?.message?.content?.trim() || null;
-  } catch { return null; }
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(60_000), body: JSON.stringify({ messages: [{ role: "system", content: "You are ContextCore, a grounded research assistant. Answer only from the supplied transcript or source excerpts. Do not use outside knowledge. If the context does not contain the answer, say exactly: I could not find this information in the indexed material. For audio/video evidence, preserve speaker labels and timestamps when relevant. Never claim a source was processed if the excerpts do not support it. Keep the answer concise." }, { role: "user", content: `Question: ${question}\n\nSource excerpts:\n${context}` }] }) });
+    const payload = await response.json().catch(() => ({})) as { error?: { message?: string } | string; choices?: Array<{ message?: { content?: string } }> };
+    if (!response.ok || payload.error) throw new Error(`Grounded answer generation failed${payload.error ? `: ${typeof payload.error === "string" ? payload.error : payload.error.message ?? "provider error"}` : ` with HTTP ${response.status}`}.`);
+    const answer = payload.choices?.[0]?.message?.content?.trim();
+    if (!answer) throw new Error("Grounded answer generation returned no answer content.");
+    return answer;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Grounded answer generation")) throw error;
+    throw new Error(`Grounded answer generation failed: ${error instanceof Error ? error.message : "unknown provider error"}.`);
+  }
 }
 
 export async function askQuestion(question: string, sessionId?: string) {
@@ -467,7 +506,7 @@ export async function askQuestion(question: string, sessionId?: string) {
   const started = Date.now();
   const sessionDocuments = await supabase.from("session_documents").select("document_id").eq("session_id", session.row.id).is("forgotten_at", null).limit(500);
   const sessionDocumentIds = (requireData(sessionDocuments, "Loading session context") as Array<{ document_id: string }>).map(row => row.document_id);
-  const cacheResult = sessionDocumentIds.length ? { data: null, error: null } : await supabase.from("answer_cache").select("answer, citations, latency_ms, total_tokens").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("corpus_version", 1).eq("normalized_question", normalized).maybeSingle();
+  const cacheResult = sessionId ? { data: null, error: null } : await supabase.from("answer_cache").select("answer, citations, latency_ms, total_tokens").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("corpus_version", 1).eq("normalized_question", normalized).maybeSingle();
   if (cacheResult.error) throw new Error(`Loading answer cache failed: ${cacheResult.error.message}`);
   const evidence = await retrieveEvidence(question, session.row.id);
   let answer: string;
@@ -479,19 +518,7 @@ export async function askQuestion(question: string, sessionId?: string) {
     const cached = (cacheResult.data.citations as QueryCitation[] | null) ?? [];
     citations = cached.length ? cached.map((item, index) => ({ ...item, chunkId: item.chunkId ?? evidence[index]?.chunkId, startMs: item.startMs ?? evidence[index]?.media?.startMs, endMs: item.endMs ?? evidence[index]?.media?.endMs, speaker: item.speaker ?? evidence[index]?.media?.speaker, timestampLabel: item.timestampLabel ?? (evidence[index]?.media ? formatTimestampRange(evidence[index].media) : undefined) })) : evidence.map(citationFromEvidence);
   } else {
-      const normalizedMatch = evidence.length ? await supabase.from("queries").select("answer").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("session_id", session.row.id).eq("normalized_question", normalized).eq("status", "answered").order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null, error: null };
-    if (normalizedMatch.error) throw new Error(`Loading previous answers failed: ${normalizedMatch.error.message}`);
-    answer = normalizedMatch.data?.answer ?? "";
-    if (!answer) {
-      if (!evidence.length) answer = "I could not find this information in the indexed material.";
-      else if (normalized.includes("latency")) answer = "Retrieval latency is kept low by maintaining a versioned index, caching normalized questions, and sending only the top relevant context to the answer service.";
-      else if (normalized.includes("rollout") || normalized.includes("owner")) answer = "Priya Nair is the launch owner for the Q3 product rollout.";
-      else if (normalized.includes("support") || normalized.includes("theme")) answer = "Export reliability is the fastest-growing support theme and appears in 31% of tagged conversations.";
-      else if (normalized.includes("validate") || normalized.includes("customer")) answer = "The customer asked the team to validate workspace-level permissions with the security team.";
-      else answer = evidence.length ? `The indexed material points to ${evidence[0].documentName}: ${evidence[0].content.slice(0, 160)}` : "I could not find this information in the indexed material.";
-      const modelAnswer = await generateWithPlatform(question, evidence);
-      if (modelAnswer) answer = modelAnswer;
-    }
+    answer = evidence.length ? await generateWithPlatform(question, evidence) : "I could not find this information in the indexed material.";
     citations = evidence.map(citationFromEvidence);
   }
   const latencyMs = cacheResult.data?.latency_ms ?? Math.max(1, Date.now() - started);

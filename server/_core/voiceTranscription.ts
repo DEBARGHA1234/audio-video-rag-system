@@ -106,13 +106,13 @@ export async function transcribeAudio(
       audioBuffer = Buffer.from(await response.arrayBuffer());
       mimeType = response.headers.get('content-type') || 'audio/mpeg';
 
-      // Check file size (16MB limit)
+      // Keep this aligned with the upload procedure and the provider request limit.
       const sizeMB = audioBuffer.length / (1024 * 1024);
-      if (sizeMB > 16) {
+      if (sizeMB > 25) {
         return {
           error: "Audio file exceeds maximum size limit",
           code: "FILE_TOO_LARGE",
-          details: `File size is ${sizeMB.toFixed(2)}MB, maximum allowed is 16MB`
+          details: `File size is ${sizeMB.toFixed(2)}MB, maximum allowed is 25MB`
         };
       }
     } catch (error) {
@@ -127,7 +127,7 @@ export async function transcribeAudio(
     const formData = new FormData();
 
     // Create a Blob from the buffer and append to form
-    const filename = `audio.${getFileExtension(mimeType)}`;
+    const filename = `media.${getFileExtension(mimeType)}`;
     const audioBlob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
     formData.append("file", audioBlob, filename);
 
@@ -207,6 +207,9 @@ function getFileExtension(mimeType: string): string {
     'audio/ogg': 'ogg',
     'audio/m4a': 'm4a',
     'audio/mp4': 'm4a',
+    'video/mp4': 'mp4',
+    'video/webm': 'webm',
+    'video/quicktime': 'mov',
   };
 
   return mimeToExt[mimeType] || 'audio';

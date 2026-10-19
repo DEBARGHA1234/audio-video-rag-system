@@ -19,6 +19,7 @@ import {
   reindexDocument,
   runEvaluation,
   transcribeSource,
+  transcribeUploadedMedia,
   createNewSession,
   updateSettings,
 } from "./workspace";
@@ -55,6 +56,7 @@ export const appRouter = router({
     documents: publicProcedure.input(z.object({ page: z.number().int().min(1).default(1), pageSize: z.number().int().min(1).max(50).default(6), search: z.string().default("") })).query(({ input }) => listDocuments(input.page, input.pageSize, input.search)),
     ingest: publicProcedure.input(z.object({ source: z.string().min(1).max(200000), sessionId: sessionIdInput.optional(), name: z.string().max(240).optional(), kind: z.string().optional(), content: z.string().max(200000).optional(), size: z.number().optional(), mediaDurationMs: z.number().min(0).optional(), transcriptVersion: z.number().int().min(1).optional(), segments: z.array(mediaSegmentInput).max(10000).optional() })).mutation(({ input }) => ingestSource(input)),
     transcribe: publicProcedure.input(z.object({ audioUrl: z.string().url().max(2000), language: z.string().max(20).optional(), prompt: z.string().max(1000).optional() })).mutation(({ input }) => transcribeSource(input)),
+    transcribeUpload: publicProcedure.input(z.object({ filename: z.string().min(1).max(240), mimeType: z.string().min(1).max(120), base64: z.string().min(1).max(36_000_000), language: z.string().max(20).optional(), prompt: z.string().max(1000).optional() })).mutation(({ input }) => transcribeUploadedMedia(input)),
     transcript: publicProcedure.input(z.object({ documentId: documentIdInput })).query(({ input }) => getTranscript(input.documentId)),
     correctTranscriptSegment: publicProcedure.input(z.object({ documentId: documentIdInput, segmentId: z.string().min(1).max(240), text: z.string().min(1).max(20000) })).mutation(({ input }) => correctTranscriptSegment(input)),
     reindex: publicProcedure.input(z.object({ documentId: documentIdInput })).mutation(({ input }) => reindexDocument(input.documentId)),
