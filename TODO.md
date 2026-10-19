@@ -1,4 +1,4 @@
-# ContextCore media-grounding outcomes
+# ContextCore completed outcomes
 
 - [x] **Timestamp-grounded answers:** Answers from audio/video sources expose start/end timestamps, source kind, and transcript excerpt in citations; the backend preserves timestamp metadata through chunking and the frontend renders clickable time chips.
 
@@ -8,7 +8,15 @@
 
 - [x] **Re-indexing after correction:** Saving a correction creates a new transcript version, replaces the selected document's chunks, clears stale embeddings, preserves timestamp/speaker metadata, invalidates non-demo answer-cache entries for the workspace, and exposes processing/indexed/error states through the document record.
 
-- [x] **Validation:** Existing routes remain response-compatible; `pnpm check`, `pnpm test`, `pnpm build`, a read-only transcript smoke test, and a cleaned Q&A canary passed without enabling the blocked Postgres runtime cutover.
+- [x] **Active session continuity:** A new or resumed session has a stable ID, shows its title and activity state, and lets the user start a new session without losing the old one.
+
+- [x] **Session-scoped media context:** Every audio/video URL or transcript ingested in the active session is linked to that session; questions in the session retrieve those sources and retain timestamp/speaker citations.
+
+- [x] **History tab:** Older sessions appear in a dedicated History view with title, last activity, source count, message count, and forgotten/active status; opening an old session does not silently inject expired context.
+
+- [x] **Gradual forgetting:** Inactive session messages expire after the configured 30-day retention horizon while session metadata and source history remain visible; forgotten context is excluded from retrieval and the UI explains how to resume with a fresh context.
+
+- [x] **Validation:** `pnpm check`, `pnpm test`, `pnpm build`, live session-scoped ingest/ask/history smoke checks, RLS verification, and temporary-row cleanup all passed.
 
 ## Current media limitation
 

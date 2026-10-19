@@ -3,11 +3,12 @@ import { Link, useLocation } from "wouter";
 import { useTheme } from "@/contexts/ThemeContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { BarChart3, BookOpen, ChevronRight, Command, FileStack, LayoutDashboard, Menu, Moon, Settings, Sun, X, Zap } from "lucide-react";
+import { BarChart3, BookOpen, ChevronRight, Command, FileStack, History, LayoutDashboard, Menu, Moon, Settings, Sun, X, Zap } from "lucide-react";
 
 const navItems = [
   { href: "/", label: "Workspace", caption: "Ask your corpus", icon: LayoutDashboard },
   { href: "/documents", label: "Documents", caption: "Indexed sources", icon: FileStack },
+  { href: "/history", label: "History", caption: "Past sessions", icon: History },
   { href: "/evaluations", label: "RAG evaluation", caption: "Quality signals", icon: BarChart3 },
   { href: "/admin", label: "Admin dashboard", caption: "Live telemetry", icon: BookOpen },
   { href: "/settings", label: "Settings", caption: "Workspace controls", icon: Settings },
@@ -16,6 +17,7 @@ const navItems = [
 const pageTitles: Record<string, string> = {
   "/": "Workspace",
   "/documents": "Documents",
+  "/history": "History",
   "/evaluations": "RAG Evaluation",
   "/admin": "Admin Dashboard",
   "/settings": "Settings",

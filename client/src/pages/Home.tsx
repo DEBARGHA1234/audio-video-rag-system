@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUpRight, Check, ClipboardPaste, CloudUpload, Clock3, FileText, Link2, Loader2, MessageSquare, Paperclip, Search, Sparkles, UploadCloud, Users, Zap } from "lucide-react";
+import { ArrowUpRight, Check, ClipboardPaste, CloudUpload, Clock3, FileText, History, Link2, Loader2, MessageSquare, Paperclip, Plus, Search, Sparkles, UploadCloud, Users, Zap } from "lucide-react";
 import { toast } from "sonner";
+import { Link } from "wouter";
 import { Button } from "@/components/ui/button";
 import AppShell, { StatusPill } from "@/components/AppShell";
 import { MetricCard } from "@/components/MetricCard";
@@ -10,10 +11,13 @@ import { cn } from "@/lib/utils";
 const examples = ["How is retrieval latency kept low?", "Who owns the Q3 rollout?", "What did the speakers agree to?"];
 
 export default function Home() {
+  const [activeSessionId, setActiveSessionId] = useState<string | undefined>(() => typeof window === "undefined" ? undefined : localStorage.getItem("contextcore.activeSessionId") ?? undefined);
+  const session = trpc.workspace.session.useQuery({ sessionId: activeSessionId });
   const overview = trpc.workspace.overview.useQuery();
-  const ingest = trpc.workspace.ingest.useMutation({ onSuccess: () => { toast.success("Source indexed", { description: "Your material is now ready for grounded questions." }); setSourceInput(""); overview.refetch(); }, onError: error => toast.error("Could not index source", { description: error.message }) });
-  const transcribe = trpc.workspace.transcribe.useMutation({ onSuccess: result => { toast.success("Transcript ready", { description: `${result.segments.length} timestamped segments are being indexed.` }); ingest.mutate({ source: result.audioUrl, kind: result.kind, content: result.text, segments: result.segments, mediaDurationMs: result.durationMs }); }, onError: error => toast.error("Could not transcribe media", { description: error.message }) });
-  const ask = trpc.workspace.ask.useMutation({ onSuccess: () => overview.refetch(), onError: error => toast.error("Question failed", { description: error.message }) });
+  const createSession = trpc.workspace.createSession.useMutation({ onSuccess: result => { localStorage.setItem("contextcore.activeSessionId", result.active.id); setActiveSessionId(result.active.id); toast.success("New session ready", { description: "Your next sources will stay inside this context." }); session.refetch(); }, onError: error => toast.error("Could not create session", { description: error.message }) });
+  const ingest = trpc.workspace.ingest.useMutation({ onSuccess: result => { if (result.sessionId) { localStorage.setItem("contextcore.activeSessionId", result.sessionId); setActiveSessionId(result.sessionId); } toast.success("Source indexed", { description: "Your material is now ready for grounded questions in this session." }); setSourceInput(""); overview.refetch(); session.refetch(); }, onError: error => toast.error("Could not index source", { description: error.message }) });
+  const transcribe = trpc.workspace.transcribe.useMutation({ onSuccess: result => { toast.success("Transcript ready", { description: `${result.segments.length} timestamped segments are being indexed.` }); ingest.mutate({ source: result.audioUrl, sessionId: activeSessionId, kind: result.kind, content: result.text, segments: result.segments, mediaDurationMs: result.durationMs }); }, onError: error => toast.error("Could not transcribe media", { description: error.message }) });
+  const ask = trpc.workspace.ask.useMutation({ onSuccess: result => { if (result.sessionId) { localStorage.setItem("contextcore.activeSessionId", result.sessionId); setActiveSessionId(result.sessionId); } overview.refetch(); session.refetch(); }, onError: error => toast.error("Question failed", { description: error.message }) });
   const [sourceInput, setSourceInput] = useState("");
   const [question, setQuestion] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -30,6 +34,23 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  useEffect(() => {
+    const onSessionChanged = (event: Event) => {
+      const next = (event as CustomEvent<string>).detail;
+      if (next) setActiveSessionId(next);
+    };
+    window.addEventListener("contextcore-session-changed", onSessionChanged);
+    return () => window.removeEventListener("contextcore-session-changed", onSessionChanged);
+  }, []);
+
+  useEffect(() => {
+    const id = session.data?.active.id;
+    if (!id) return;
+    if (id !== activeSessionId) setActiveSessionId(id);
+    localStorage.setItem("contextcore.activeSessionId", id);
+    if (session.data?.replacedSessionId) toast.info("This session’s message context was forgotten", { description: "A fresh context is active. The source trail remains in History." });
+  }, [session.data?.active.id, session.data?.replacedSessionId]);
+
   const handleFile = (file?: File) => {
     if (!file) return;
     if (/\.(mp3|wav|m4a|ogg|aac|mp4|webm|mov)$/i.test(file.name)) {
@@ -39,27 +60,29 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = () => {
       const raw = typeof reader.result === "string" ? reader.result : `Uploaded ${file.name}`;
-      ingest.mutate({ source: raw, content: raw, name: file.name, size: file.size, kind: file.name.split(".").pop()?.toUpperCase() });
+      ingest.mutate({ source: raw, sessionId: activeSessionId, content: raw, name: file.name, size: file.size, kind: file.name.split(".").pop()?.toUpperCase() });
     };
     if (file.type.startsWith("text/") || /\.(md|markdown|csv|json)$/i.test(file.name)) reader.readAsText(file);
-    else ingest.mutate({ source: `Uploaded file: ${file.name}`, name: file.name, size: file.size, kind: file.name.split(".").pop()?.toUpperCase() });
+    else ingest.mutate({ source: `Uploaded file: ${file.name}`, sessionId: activeSessionId, name: file.name, size: file.size, kind: file.name.split(".").pop()?.toUpperCase() });
   };
 
   const submitSource = () => {
     if (!sourceInput.trim()) { toast.info("Paste a link or some text first"); return; }
     const mediaUrl = /\.(mp3|wav|m4a|ogg|aac|mp4|webm|mov)(?:\?.*)?$/i.test(sourceInput.trim());
     if (mediaUrl) transcribe.mutate({ audioUrl: sourceInput.trim() });
-    else ingest.mutate({ source: sourceInput, content: sourceInput, kind: /^https?:\/\//i.test(sourceInput) ? "URL" : "TXT" });
+    else ingest.mutate({ source: sourceInput, sessionId: activeSessionId, content: sourceInput, kind: /^https?:\/\//i.test(sourceInput) ? "URL" : "TXT" });
   };
   const submitQuestion = () => {
     if (!question.trim()) return;
-    ask.mutate({ question: question.trim() });
+    ask.mutate({ question: question.trim(), sessionId: activeSessionId });
   };
   const latestAnswer = ask.data;
   const data = overview.data;
 
   return <AppShell><div className="space-y-8">
     <section className="hero-grid"><div><p className="eyebrow text-[var(--cyan-ink)]">Workspace / grounded intelligence</p><h2 className="mt-3 max-w-3xl text-4xl font-semibold leading-[1.04] tracking-[-0.055em] text-[var(--ink)] sm:text-6xl">Ask the corpus,<br /><span className="text-[var(--cyan-ink)]">not the guess.</span></h2><p className="mt-5 max-w-xl text-base leading-7 text-[var(--muted)]">Bring scattered files, links, and timestamped conversations into one clean, searchable context. Every answer comes back with the evidence that shaped it.</p><div className="mt-6 flex flex-wrap items-center gap-3"><StatusPill label="Index operational" /><span className="text-xs text-[var(--muted)]">{data?.corpus.chunks.toLocaleString() ?? "—"} chunks ready for retrieval</span></div></div><div className="hero-signal hidden lg:block"><div className="signal-orbit orbit-one" /><div className="signal-orbit orbit-two" /><div className="signal-core"><Sparkles size={23} /></div><span className="signal-label signal-label-a">INDEX / v1.4.8</span><span className="signal-label signal-label-b">RAG / READY</span><span className="signal-label signal-label-c">MEDIA / GROUNDED</span></div></section>
+
+    <section className="panel flex flex-col justify-between gap-4 p-4 sm:flex-row sm:items-center sm:p-5"><div className="flex min-w-0 items-center gap-3"><div className="empty-icon"><History size={16} /></div><div className="min-w-0"><p className="eyebrow">Active session</p><h3 className="truncate text-sm font-semibold text-[var(--ink)]">{session.isLoading ? "Opening context…" : session.data?.active.title ?? "Untitled session"}</h3><p className="mt-1 truncate text-xs text-[var(--muted)]">{session.data?.active.documents.length ?? 0} sources retained · {session.data?.active.messageCount ?? 0} messages · forgetting after 30 days inactive</p></div></div><div className="flex shrink-0 flex-wrap items-center gap-2"><Link href="/history" className="tab-button"><History size={14} /> History</Link><Button variant="outline" size="sm" onClick={() => createSession.mutate({})} disabled={createSession.isPending}>{createSession.isPending ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />} New session</Button></div></section>
 
     <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><MetricCard label="Indexed sources" value={data ? data.metrics.documents.toLocaleString() : "—"} note="Across the active workspace" icon={<FileText size={16} />} tone="cyan" loading={overview.isLoading} /><MetricCard label="Questions answered" value={data ? data.metrics.queries.toLocaleString() : "—"} note="Grounded requests this month" icon={<MessageSquare size={16} />} tone="violet" loading={overview.isLoading} /><MetricCard label="Avg retrieval" value={data ? `${data.metrics.avgLatency.toFixed(2)}s` : "—"} note="Across cached + live requests" icon={<Zap size={16} />} tone="amber" loading={overview.isLoading} /><MetricCard label="Daily active" value={data ? data.metrics.dailyActiveUsers.toLocaleString() : "—"} note="People asking the corpus today" icon={<Search size={16} />} tone="coral" loading={overview.isLoading} /></section>
 

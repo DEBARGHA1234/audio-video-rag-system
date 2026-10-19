@@ -8,6 +8,7 @@ import Admin from "./pages/Admin";
 import Documents from "./pages/Documents";
 import Evaluations from "./pages/Evaluations";
 import Home from "./pages/Home";
+import History from "./pages/History";
 import Settings from "./pages/Settings";
 
 function Router() {
@@ -16,6 +17,7 @@ function Router() {
     <Switch>
       <Route path={"/"} component={Home} />
       <Route path={"/documents"} component={Documents} />
+      <Route path={"/history"} component={History} />
       <Route path={"/evaluations"} component={Evaluations} />
       <Route path={"/admin"} component={Admin} />
       <Route path={"/settings"} component={Settings} />

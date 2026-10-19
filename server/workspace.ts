@@ -55,9 +55,23 @@ export interface QueryLog {
   createdAt: string;
 }
 
+export interface SessionSummary {
+  id: string;
+  title: string;
+  status: "active" | "archived" | "forgotten";
+  lastActiveAt: string;
+  contextExpiresAt: string | null;
+  contextForgotten: boolean;
+  documentCount: number;
+  messageCount: number;
+  documents: Array<{ id: string; name: string; kind: SourceKind; isVideo: boolean; addedAt: string }>;
+  messages: Array<{ id: string; role: "user" | "assistant" | "system"; content: string; createdAt: string; isForgotten: boolean }>;
+}
+
 export interface IngestInput {
   name?: string;
   source: string;
+  sessionId?: string;
   kind?: string;
   content?: string;
   size?: number;
@@ -123,8 +137,16 @@ type EvidenceItem = {
   media: MediaMetadata | null;
 };
 
+const SESSION_RETENTION_DAYS = 30;
+const SESSION_RETENTION_MS = SESSION_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
 function normalize(value: string) { return value.toLowerCase().replace(/\s+/g, " ").trim(); }
 function hash(value: string) { return createHash("sha256").update(value).digest("hex"); }
+function sessionExpiry() { return new Date(Date.now() + SESSION_RETENTION_MS).toISOString(); }
+function sessionTitle(value?: string) {
+  const clean = value?.replace(/\s+/g, " ").trim();
+  return clean ? clean.slice(0, 80) : "Untitled session";
+}
 function chunkText(value: string) {
   const words = value.split(/\s+/).filter(Boolean);
   const size = 80;
@@ -240,6 +262,89 @@ async function countRows(table: string) {
   return result.count ?? 0;
 }
 
+async function expireSessionContext() {
+  const supabase = getSupabase();
+  const now = new Date().toISOString();
+  await supabase.from("session_messages").update({ is_forgotten: true, forgotten_at: now }).eq("is_forgotten", false).lt("expires_at", now);
+  await supabase.from("chat_sessions").update({ status: "forgotten", forgotten_at: now, updated_at: now }).eq("status", "active").lt("context_expires_at", now);
+}
+
+async function createSession(title?: string) {
+  const now = new Date().toISOString();
+  const result = await getSupabase().from("chat_sessions").insert({
+    id: randomUUID(),
+    workspace_id: CONTEXTCORE_WORKSPACE_ID,
+    title: sessionTitle(title),
+    status: "active",
+    context_mode: "session",
+    created_at: now,
+    updated_at: now,
+    last_active_at: now,
+    context_expires_at: sessionExpiry(),
+    message_count: 0,
+    document_count: 0,
+    is_demo: false,
+  }).select("id, title, status, last_active_at, context_expires_at, forgotten_at, message_count, document_count").single();
+  return requireData(result, "Creating session") as { id: string; title: string; status: SessionSummary["status"]; last_active_at: string; context_expires_at: string | null; forgotten_at: string | null; message_count: number; document_count: number };
+}
+
+async function ensureActiveSession(sessionId?: string, title?: string) {
+  await expireSessionContext();
+  const supabase = getSupabase();
+  if (sessionId) {
+    const result = await supabase.from("chat_sessions").select("id, title, status, last_active_at, context_expires_at, forgotten_at, message_count, document_count").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", sessionId).maybeSingle();
+    if (result.error) throw new Error(`Loading session failed: ${result.error.message}`);
+    const row = result.data as { id: string; title: string; status: SessionSummary["status"]; last_active_at: string; context_expires_at: string | null; forgotten_at: string | null; message_count: number; document_count: number } | null;
+    if (row && row.status === "active" && (!row.context_expires_at || new Date(row.context_expires_at).getTime() > Date.now())) {
+      const now = new Date().toISOString();
+      const touched = await supabase.from("chat_sessions").update({ last_active_at: now, context_expires_at: sessionExpiry(), updated_at: now }).eq("id", row.id).select("id, title, status, last_active_at, context_expires_at, forgotten_at, message_count, document_count").single();
+      return { row: requireData(touched, "Updating session activity") as typeof row, replacedSessionId: undefined };
+    }
+  }
+  const row = await createSession(title);
+  return { row, replacedSessionId: sessionId };
+}
+
+async function sessionSnapshot(sessionId: string, replacedSessionId?: string) {
+  const supabase = getSupabase();
+  const sessionResult = await supabase.from("chat_sessions").select("id, title, status, last_active_at, context_expires_at, forgotten_at, message_count, document_count").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("id", sessionId).single();
+  const session = requireData(sessionResult, "Loading session") as { id: string; title: string; status: SessionSummary["status"]; last_active_at: string; context_expires_at: string | null; forgotten_at: string | null; message_count: number; document_count: number };
+  const [documentsResult, messagesResult] = await Promise.all([
+    supabase.from("session_documents").select("document_id, is_video, added_at, documents(name, kind)").eq("session_id", sessionId).is("forgotten_at", null).order("added_at", { ascending: false }).limit(50),
+    supabase.from("session_messages").select("id, role, content, created_at, is_forgotten").eq("session_id", sessionId).eq("is_forgotten", false).order("created_at", { ascending: true }).limit(100),
+  ]);
+  const documents = (requireData(documentsResult, "Loading session sources") as Array<{ document_id: string; is_video: boolean; added_at: string; documents: { name: string; kind: SourceKind } | Array<{ name: string; kind: SourceKind }> | null }>).map(item => {
+    const document = Array.isArray(item.documents) ? item.documents[0] : item.documents;
+    return { id: item.document_id, name: document?.name ?? "Source", kind: document?.kind ?? "TXT", isVideo: item.is_video, addedAt: relativeTime(item.added_at) };
+  });
+  const messages = (requireData(messagesResult, "Loading session messages") as Array<{ id: string; role: "user" | "assistant" | "system"; content: string; created_at: string; is_forgotten: boolean }>).map(item => ({ id: item.id, role: item.role, content: item.content, createdAt: relativeTime(item.created_at), isForgotten: item.is_forgotten }));
+  return { active: { id: session.id, title: session.title, status: session.status, lastActiveAt: relativeTime(session.last_active_at), contextExpiresAt: session.context_expires_at, contextForgotten: Boolean(session.forgotten_at) || session.status === "forgotten", documentCount: session.document_count, messageCount: session.message_count, documents, messages } satisfies SessionSummary, replacedSessionId };
+}
+
+export async function getActiveSession(sessionId?: string) {
+  const { row, replacedSessionId } = await ensureActiveSession(sessionId);
+  return sessionSnapshot(row.id, replacedSessionId);
+}
+
+export async function createNewSession(title?: string) {
+  const row = await createSession(title);
+  return sessionSnapshot(row.id);
+}
+
+export async function listSessionHistory(page = 1, pageSize = 12) {
+  await expireSessionContext();
+  const supabase = getSupabase();
+  const start = (page - 1) * pageSize;
+  const result = await supabase.from("chat_sessions").select("id, title, status, last_active_at, context_expires_at, forgotten_at, message_count, document_count", { count: "exact" }).eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).order("last_active_at", { ascending: false }).range(start, start + pageSize - 1);
+  const rows = requireData(result, "Loading session history") as Array<{ id: string; title: string; status: SessionSummary["status"]; last_active_at: string; context_expires_at: string | null; forgotten_at: string | null; message_count: number; document_count: number }>;
+  return { items: rows.map(row => ({ id: row.id, title: row.title, status: row.status, lastActiveAt: relativeTime(row.last_active_at), contextExpiresAt: row.context_expires_at, contextForgotten: Boolean(row.forgotten_at) || row.status === "forgotten", documentCount: row.document_count, messageCount: row.message_count })), page, pageSize, total: result.count ?? 0, hasMore: start + pageSize < (result.count ?? 0) };
+}
+
+export async function getSessionHistoryItem(sessionId: string) {
+  await expireSessionContext();
+  return sessionSnapshot(sessionId);
+}
+
 export async function getOverview() {
   const supabase = getSupabase();
   const [documents, queries, activityResult, usageResult, evaluationTrendResult, documentCount, queryCount, chunkCount] = await Promise.all([
@@ -290,6 +395,7 @@ export async function ingestSource(input: IngestInput) {
     : chunkText(content).map(chunk => ({ content: chunk, metadata: { source: "ingest", transcriptVersion: version } }));
   const id = randomUUID();
   const name = input.name || (source.startsWith("http") ? new URL(source).hostname : "Pasted research note.txt");
+  const session = await ensureActiveSession(input.sessionId, name);
   const speakerCount = new Set(segments.map(segment => segment.speaker)).size;
   const tags = segments.length ? ["Transcript", "Timestamped", `${speakerCount} speaker${speakerCount === 1 ? "" : "s"}`] : ["New source"];
   const document = { id, workspace_id: CONTEXTCORE_WORKSPACE_ID, name, kind, source_uri: source, content_hash: hash(content), raw_size_bytes: input.size ?? null, display_size: formatBytes(input.size), status: "indexed", summary: content.slice(0, 142) + (content.length > 142 ? "…" : ""), cleaned_content: content, tags, chunk_count: blueprints.length, uploaded_by_manus_user_id: null, is_demo: false };
@@ -297,8 +403,10 @@ export async function ingestSource(input: IngestInput) {
   const inserted = requireData(insertResult, "Saving document") as DocumentRow;
   const chunkRows = blueprints.map((blueprint, index) => ({ id: randomUUID(), document_id: id, workspace_id: CONTEXTCORE_WORKSPACE_ID, chunk_index: index, content: blueprint.content, content_hash: hash(`${id}:${index}:${blueprint.content}`), token_count: blueprint.content.split(/\s+/).filter(Boolean).length, embedding: null, embedding_provider: null, metadata: blueprint.metadata, is_demo: false }));
   requireMutation(await supabase.from("document_chunks").insert(chunkRows), "Saving document chunks");
+  requireMutation(await supabase.from("session_documents").upsert({ session_id: session.row.id, document_id: id, added_at: new Date().toISOString(), last_used_at: new Date().toISOString(), retain_until: session.row.context_expires_at, is_video: kind === "VIDEO" || kind === "AUDIO", is_demo: false }, { onConflict: "session_id,document_id" }), "Linking source to session");
+  requireMutation(await supabase.from("chat_sessions").update({ title: session.row.title === "Untitled session" ? sessionTitle(name) : session.row.title, document_count: session.row.document_count + 1, last_active_at: new Date().toISOString(), context_expires_at: sessionExpiry(), updated_at: new Date().toISOString() }).eq("id", session.row.id), "Updating session source count");
   requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: segments.length ? "transcript_indexed" : "index_refreshed", label: segments.length ? "Transcript indexed" : "Source indexed", detail: `${name} · ${blueprints.length} chunks${segments.length ? ` · ${speakerCount} speakers` : ""}`, tone: "good", is_demo: false }), "Saving activity");
-  return { ...mapDocument(inserted), content: undefined, transcript: segments.length ? { segmentCount: segments.length, speakerCount, durationMs: input.mediaDurationMs ?? Math.max(...segments.map(segment => segment.endMs), 0), version } : undefined };
+  return { ...mapDocument(inserted), content: undefined, sessionId: session.row.id, transcript: segments.length ? { segmentCount: segments.length, speakerCount, durationMs: input.mediaDurationMs ?? Math.max(...segments.map(segment => segment.endMs), 0), version } : undefined };
 }
 
 export async function transcribeSource(input: { audioUrl: string; language?: string; prompt?: string }) {
@@ -308,9 +416,16 @@ export async function transcribeSource(input: { audioUrl: string; language?: str
   return { audioUrl: input.audioUrl, kind: /\.(mp4|webm|mov)(?:\?|$)/i.test(input.audioUrl) ? "VIDEO" as const : "AUDIO" as const, language: result.language, durationMs: Math.round(result.duration * 1000), text: result.text, segments };
 }
 
-async function retrieveEvidence(question: string) {
+async function retrieveEvidence(question: string, sessionId?: string) {
   const supabase = getSupabase();
-  const result = await supabase.from("document_chunks").select("id, document_id, chunk_index, content, metadata, documents(name, source_uri, kind)").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).order("chunk_index", { ascending: true }).limit(500);
+  let sessionDocumentIds: string[] = [];
+  if (sessionId) {
+    const sessionDocuments = await supabase.from("session_documents").select("document_id").eq("session_id", sessionId).is("forgotten_at", null).limit(500);
+    sessionDocumentIds = (requireData(sessionDocuments, "Loading session sources") as Array<{ document_id: string }>).map(row => row.document_id);
+  }
+  let query = supabase.from("document_chunks").select("id, document_id, chunk_index, content, metadata, documents(name, source_uri, kind)").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).order("chunk_index", { ascending: true }).limit(500);
+  if (sessionDocumentIds.length) query = query.in("document_id", sessionDocumentIds);
+  const result = await query;
   const rows = requireData(result, "Loading retrieval chunks") as Array<{ id: string; document_id: string; chunk_index: number; content: string; metadata: unknown; documents: RelationDocument }>;
   const normalized = normalize(question);
   const terms = normalized.split(" ").filter(term => term.length > 3);
@@ -345,13 +460,16 @@ async function generateWithPlatform(question: string, evidence: EvidenceItem[]) 
   } catch { return null; }
 }
 
-export async function askQuestion(question: string) {
+export async function askQuestion(question: string, sessionId?: string) {
   const supabase = getSupabase();
   const normalized = normalize(question);
+  const session = await ensureActiveSession(sessionId);
   const started = Date.now();
-  const cacheResult = await supabase.from("answer_cache").select("answer, citations, latency_ms, total_tokens").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("corpus_version", 1).eq("normalized_question", normalized).maybeSingle();
+  const sessionDocuments = await supabase.from("session_documents").select("document_id").eq("session_id", session.row.id).is("forgotten_at", null).limit(500);
+  const sessionDocumentIds = (requireData(sessionDocuments, "Loading session context") as Array<{ document_id: string }>).map(row => row.document_id);
+  const cacheResult = sessionDocumentIds.length ? { data: null, error: null } : await supabase.from("answer_cache").select("answer, citations, latency_ms, total_tokens").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("corpus_version", 1).eq("normalized_question", normalized).maybeSingle();
   if (cacheResult.error) throw new Error(`Loading answer cache failed: ${cacheResult.error.message}`);
-  const evidence = await retrieveEvidence(question);
+  const evidence = await retrieveEvidence(question, session.row.id);
   let answer: string;
   let cacheHit = false;
   let citations: QueryCitation[];
@@ -361,7 +479,7 @@ export async function askQuestion(question: string) {
     const cached = (cacheResult.data.citations as QueryCitation[] | null) ?? [];
     citations = cached.length ? cached.map((item, index) => ({ ...item, chunkId: item.chunkId ?? evidence[index]?.chunkId, startMs: item.startMs ?? evidence[index]?.media?.startMs, endMs: item.endMs ?? evidence[index]?.media?.endMs, speaker: item.speaker ?? evidence[index]?.media?.speaker, timestampLabel: item.timestampLabel ?? (evidence[index]?.media ? formatTimestampRange(evidence[index].media) : undefined) })) : evidence.map(citationFromEvidence);
   } else {
-    const normalizedMatch = evidence.length ? await supabase.from("queries").select("answer").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("normalized_question", normalized).eq("status", "answered").order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null, error: null };
+      const normalizedMatch = evidence.length ? await supabase.from("queries").select("answer").eq("workspace_id", CONTEXTCORE_WORKSPACE_ID).eq("session_id", session.row.id).eq("normalized_question", normalized).eq("status", "answered").order("created_at", { ascending: false }).limit(1).maybeSingle() : { data: null, error: null };
     if (normalizedMatch.error) throw new Error(`Loading previous answers failed: ${normalizedMatch.error.message}`);
     answer = normalizedMatch.data?.answer ?? "";
     if (!answer) {
@@ -379,13 +497,19 @@ export async function askQuestion(question: string) {
   const latencyMs = cacheResult.data?.latency_ms ?? Math.max(1, Date.now() - started);
   const totalTokens = cacheResult.data?.total_tokens ?? 220 + Math.round(answer.length * 0.8);
   const queryId = randomUUID();
-  const queryResult = await supabase.from("queries").insert({ id: queryId, workspace_id: CONTEXTCORE_WORKSPACE_ID, question, normalized_question: normalized, answer, status: "answered", latency_ms: latencyMs, retrieval_latency_ms: Math.max(1, Math.round(latencyMs * 0.4)), total_tokens: totalTokens, cache_hit: cacheHit, model: cacheHit ? "cache" : "grounded" }).select("id, question, answer, latency_ms, total_tokens, cache_hit, created_at, status").single();
+  const queryResult = await supabase.from("queries").insert({ id: queryId, workspace_id: CONTEXTCORE_WORKSPACE_ID, session_id: session.row.id, question, normalized_question: normalized, answer, status: "answered", latency_ms: latencyMs, retrieval_latency_ms: Math.max(1, Math.round(latencyMs * 0.4)), total_tokens: totalTokens, cache_hit: cacheHit, model: cacheHit ? "cache" : "grounded" }).select("id, question, answer, latency_ms, total_tokens, cache_hit, created_at, status").single();
   const query = requireData(queryResult, "Saving query") as QueryRow;
   const citationRows = citations.map((citation, index) => ({ query_id: queryId, document_id: citation.documentId, chunk_id: citation.chunkId ?? null, rank: index + 1, score: citation.score, excerpt: citation.excerpt, is_demo: false }));
   if (citationRows.length) requireMutation(await supabase.from("query_citations").insert(citationRows), "Saving citations");
   if (!cacheHit) await supabase.from("answer_cache").upsert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, corpus_version: 1, normalized_question: normalized, answer, citations, latency_ms: latencyMs, total_tokens: totalTokens, expires_at: new Date(Date.now() + 30 * 86400000).toISOString(), is_demo: false });
+  const now = new Date().toISOString();
+  requireMutation(await supabase.from("session_messages").insert([
+    { id: randomUUID(), session_id: session.row.id, role: "user", content: question, citations: [], created_at: now, expires_at: sessionExpiry(), is_demo: false },
+    { id: randomUUID(), session_id: session.row.id, role: "assistant", content: answer, citations, created_at: now, expires_at: sessionExpiry(), is_demo: false },
+  ]), "Saving session messages");
+  requireMutation(await supabase.from("chat_sessions").update({ message_count: session.row.message_count + 2, last_active_at: now, context_expires_at: sessionExpiry(), updated_at: now }).eq("id", session.row.id), "Updating session activity");
   requireMutation(await supabase.from("activity_events").insert({ workspace_id: CONTEXTCORE_WORKSPACE_ID, event_type: cacheHit ? "cache_hit" : "answer_generated", label: cacheHit ? "Answer served from cache" : "Grounded answer generated", detail: question, tone: cacheHit ? "info" : "good", is_demo: false }), "Saving query activity");
-  return mapQuery(query, citations);
+  return { ...mapQuery(query, citations), sessionId: session.row.id };
 }
 
 export async function getTranscript(documentId: string) {
